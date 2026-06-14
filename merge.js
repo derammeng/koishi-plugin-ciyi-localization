@@ -1,61 +1,70 @@
-// merge.js
 const fs = require('fs');
-const fsPromises = require('fs/promises');
 const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const readline = require('readline');
 
-async function main() {
-  const dirPath = path.join(__dirname, 'data', 'ciyi'); 
-  const outputPath = path.join(__dirname, 'plugins', 'koishi-plugin-ciyi-localization', 'data', 'lexicon.json');
-  
-  await fsPromises.mkdir(path.dirname(outputPath), { recursive: true });
-  
-  console.log('正在读取词库目录...');
-  const files = await fsPromises.readdir(dirPath);
-  const txtFiles = files.filter(f => f.endsWith('.txt'));
-  console.log(`总共发现 ${txtFiles.length} 个文本文件，开始合并...`);
-
-  const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf-8' });
-  
-  writeStream.write('{\n');
-
-  for (let i = 0; i < txtFiles.length; i++) {
-    const file = txtFiles[i];
-    const word = path.basename(file, '.txt');
-    const filePath = path.join(dirPath, file);
-    
-    const content = await fsPromises.readFile(filePath, 'utf-8');
-    
-    const safeContent = content.trim()
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r');
-
-    const isLast = i === txtFiles.length - 1;
-    const jsonLine = `  "${word}": "${safeContent}"${isLast ? '' : ',\n'}`;
-    
-    writeStream.write(jsonLine);
-
-    if ((i + 1) % 5000 === 0) {
-      console.log(`进度: 已处理 ${i + 1} / ${txtFiles.length} 个文件...`);
-    }
-  }
-
-  writeStream.write('\n}');
-  writeStream.end();
-
-  writeStream.on('finish', () => {
-    console.log('\n=========================================');
-    console.log(`JSON 词库已生成`);
-    console.log(`输出路径: ${outputPath}`);
-    console.log('=========================================');
-  });
-}
-
-main().catch(err => {
-  if (err.code === 'ENOENT') {
-    console.error(`\n❌ 错误：找不到词库目录！请检查路径是否为: ${err.path}`);
-  } else {
-    console.error('\n❌ 合并过程中发生错误:', err);
-  }
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
 });
+
+const CONFIGS = {
+    1: { name: 'SAFE', batch: 0 },
+    2: { name: 'BALANCED', batch: 5000 },
+    3: { name: 'FAST', batch: 20000 }
+};
+
+console.log("请选择迁移模式:");
+console.log("1. SAFE     (batch=0)     内存占用最低，逐条写入，最稳，速度慢");
+console.log("2. BALANCED (batch=5000)  内存适中，分批写入，推荐");
+console.log("3. FAST     (batch=20000) 内存占用最高，大批次写入，极限速度 (16GB内存推荐)");
+
+rl.question("输入数字 (1-3): ", (answer) => {
+    const config = CONFIGS[answer];
+    if (!config) {
+        console.log("输入错误，请重新运行脚本。");
+        process.exit(1);
+    }
+    
+    rl.close();
+    startMigration(config);
+});
+
+function startMigration(config) {
+    const db = new sqlite3.Database('lexicon.db');
+    const dir = path.join(__dirname, 'data', 'ciyi');
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.txt'));
+
+    console.log(`已选择: ${config.name} 模式，开始处理 ${files.length} 个文件...`);
+
+    db.serialize(() => {
+        db.run("PRAGMA journal_mode = OFF");
+        db.run("PRAGMA synchronous = OFF");
+        db.run("CREATE TABLE IF NOT EXISTS lexicon (word TEXT PRIMARY KEY, meaning TEXT)");
+
+        const stmt = db.prepare("INSERT OR REPLACE INTO lexicon VALUES (?, ?)");
+        
+        if (config.batch > 0) db.run("BEGIN TRANSACTION");
+
+        let count = 0;
+        for (const f of files) {
+            const word = path.basename(f, '.txt');
+            const content = fs.readFileSync(path.join(dir, f), 'utf-8');
+            
+            stmt.run(word, content);
+            count++;
+
+            if (config.batch > 0 && count % config.batch === 0) {
+                db.run("COMMIT");
+                db.run("BEGIN TRANSACTION");
+                process.stdout.write(`Progress: ${count}/${files.length}\r`);
+            }
+        }
+
+        stmt.finalize(() => {
+            if (config.batch > 0) db.run("COMMIT");
+            console.log(`\n迁移完成。总计: ${count}`);
+            db.close();
+        });
+    });
+}
